@@ -136,14 +136,12 @@ builder.defineStreamHandler(async ({ type, id }) => {
             name: 'Letterboxio',
             description: ratingDisplay,
             url: `${baseUrl}/noop`,
-            behaviorHints: { notWebReady: true },
         },
         // Separator / prompt
         {
             name: 'Letterboxio',
             description: 'Rate this film on Letterboxd',
             url: `${baseUrl}/noop`,
-            behaviorHints: { notWebReady: true },
         },
         // One stream per star rating — Stremio "plays" this URL silently,
         // our server does the rating and returns an empty M3U8 to end playback.
@@ -151,7 +149,6 @@ builder.defineStreamHandler(async ({ type, id }) => {
             name: 'Rate on Letterboxd',
             description: opt.label,
             url: `${baseUrl}/rate/${encodeURIComponent(id)}/${encodeURIComponent(opt.stars)}`,
-            behaviorHints: { notWebReady: true },
         })),
     ];
 
