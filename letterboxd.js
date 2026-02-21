@@ -479,55 +479,49 @@ async function removeFromWatchlist(slug) {
 // correct film page. We follow that redirect with axios (no Puppeteer needed).
 
 async function resolveSlugFromImdbViaPuppeteer(imdbId) {
-    // Axios is blocked by Cloudflare (403) on film pages — must use the stealth
-    // Puppeteer browser which is already logged in and bypasses Cloudflare.
-    // waitUntil:'load' ensures the JS redirect from /film/imdb/{id}/ has fired
-    // before we read the final URL.
-    let page;
+    // Strategy: use the session cookies from the logged-in Puppeteer browser to
+    // make an axios request. Authenticated requests bypass Cloudflare's bot check.
+    // This is much lighter than opening a new Puppeteer page (no Chrome rendering).
     try {
         const b = await ensureBrowserLoggedIn();
-        page = await b.newPage();
 
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                req.abort();
-            } else {
-                req.continue();
-            }
+        // Extract session cookies from the browser
+        const cookies = await b.cookies(`${BASE_URL}/film/imdb/${imdbId}/`);
+        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+        const res = await axios.get(`${BASE_URL}/film/imdb/${imdbId}/`, {
+            headers: {
+                ...BASE_HEADERS,
+                'Cookie': cookieHeader,
+            },
+            timeout: 15000,
+            maxRedirects: 5,
+            validateStatus: s => s < 500,
         });
 
-        await page.goto(`${BASE_URL}/film/imdb/${imdbId}/`, {
-            waitUntil: 'load',
-            timeout: 25000,
-        });
+        const responseUrl = res.request?.res?.responseUrl || '';
+        console.log(`[resolveSlug] ${imdbId} status=${res.status} responseUrl="${responseUrl}"`);
 
-        const finalUrl = page.url();
-        console.log(`[resolveSlug] ${imdbId} finalUrl="${finalUrl}"`);
-
-        const match = finalUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
-        if (match && match[1] !== 'imdb') {
-            console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via Puppeteer)`);
-            await page.close();
-            return match[1];
+        // Check the final redirected URL first
+        const urlMatch = responseUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
+        if (urlMatch && urlMatch[1] !== 'imdb') {
+            console.log(`[resolveSlug] ${imdbId} → ${urlMatch[1]} (via authed axios redirect)`);
+            return urlMatch[1];
         }
 
-        // URL didn't change — try og:url from the rendered HTML
-        const ogUrl = await page.evaluate(() =>
-            document.querySelector('meta[property="og:url"]')?.content || ''
-        );
+        // Fall back to og:url in the HTML
+        const $ = cheerio.load(res.data);
+        const ogUrl = $('meta[property="og:url"]').attr('content') || '';
         console.log(`[resolveSlug] ${imdbId} og:url="${ogUrl}"`);
         const ogMatch = ogUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
         if (ogMatch && ogMatch[1] !== 'imdb') {
             console.log(`[resolveSlug] ${imdbId} → ${ogMatch[1]} (via og:url)`);
-            await page.close();
             return ogMatch[1];
         }
 
-        await page.close();
+        console.warn(`[resolveSlug] ${imdbId} — no slug found. HTML snippet: ${res.data.slice(0, 200).replace(/\s+/g, ' ')}`);
     } catch (err) {
-        if (page) await page.close().catch(() => {});
-        console.error(`[resolveSlug] Puppeteer failed for ${imdbId}:`, err.message);
+        console.error(`[resolveSlug] authed axios failed for ${imdbId}:`, err.message);
     }
 
     console.error(`[resolveSlug] Could not resolve slug for ${imdbId}`);
