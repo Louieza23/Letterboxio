@@ -4,7 +4,7 @@ const { addonBuilder } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession } = require('./letterboxd');
+const { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession, getFromCache } = require('./letterboxd');
 
 const USERNAME = process.env.LETTERBOXD_USERNAME || 'snuffalobill';
 const PORT = process.env.PORT || 7000;
@@ -108,18 +108,27 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     const baseUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 
-    // Look up existing rating — resolve IMDB ID to slug first (cached after first call)
-    const slug = await resolveSlugFromImdb(id).catch(() => null);
+    // Use only what's already cached — never block the stream response on Puppeteer.
+    // Stremio has a short timeout (~10s); a cold Puppeteer login takes 30s+.
+    // We kick off background fetches so the cache is warm on the next open.
+    const slug = imdbToSlugCache.get(id) || null;
+
     let ratingDisplay = 'Not yet rated on Letterboxd';
     if (slug) {
-        const rating = await getUserRating(USERNAME, slug).catch(() => null);
-        if (rating !== null) {
-            const full = Math.floor(rating);
-            const half = rating % 1 >= 0.5;
+        // Check cache directly — getCache is synchronous
+        const cachedRating = getFromCache(`userrating:${USERNAME}:${slug}`);
+        if (cachedRating !== null) {
+            const full = Math.floor(cachedRating);
+            const half = cachedRating % 1 >= 0.5;
             const stars = '★'.repeat(full) + (half ? '½' : '');
-            ratingDisplay = `Your rating: ${stars} (${rating} stars)`;
+            ratingDisplay = `Your rating: ${stars} (${cachedRating} stars)`;
         }
     }
+
+    // Kick off background resolution so next open is fast (don't await)
+    resolveSlugFromImdb(id).then(s => {
+        if (s) getUserRating(USERNAME, s).catch(() => {});
+    }).catch(() => {});
 
     const streams = [
         // Current rating display (top, non-clickable)

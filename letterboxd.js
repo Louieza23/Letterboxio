@@ -348,4 +348,4 @@ async function rateFilm(slug, starRating) {
     }
 }
 
-module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession };
+module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession, getFromCache: getCache };
