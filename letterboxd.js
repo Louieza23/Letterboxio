@@ -379,6 +379,93 @@ async function rateFilm(slug, starRating) {
     }
 }
 
+// ── Add to watchlist (via Puppeteer) ─────────────────────────────────────────
+
+async function addToWatchlist(slug) {
+    let page;
+    try {
+        const b = await ensureBrowserLoggedIn();
+        page = await b.newPage();
+
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        const filmUrl = `${BASE_URL}/film/${slug}/`;
+        console.log(`[puppeteer] Navigating to ${filmUrl} (watchlist)`);
+        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+        const pageTitle = await page.title();
+        if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
+            console.log(`[puppeteer] Cloudflare challenge detected, waiting...`);
+            await new Promise(r => setTimeout(r, 5000));
+            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+        }
+
+        // Grab the watchlist action URL and CSRF from the page
+        const widgetData = await page.evaluate(() => {
+            const csrf = document.querySelector('input[name="__csrf"]')?.value
+                || document.querySelector('meta[name="csrf-token"]')?.content
+                || document.body.getAttribute('data-csrf');
+            // Watchlist button has data-action pointing to the toggle endpoint
+            const btn = document.querySelector('[data-action*="watchlist"], .toggle-watchlist');
+            return {
+                watchlistAction: btn?.getAttribute('data-action') || btn?.getAttribute('data-watchlist-action'),
+                filmId: document.querySelector('[data-film-id]')?.getAttribute('data-film-id'),
+                csrf,
+            };
+        });
+
+        console.log(`[puppeteer] watchlistAction=${widgetData.watchlistAction} filmId=${widgetData.filmId}`);
+
+        if (!widgetData.csrf) {
+            await page.close();
+            return { success: false, error: 'Could not find CSRF token' };
+        }
+
+        // If we found a direct action URL, POST to it
+        // Otherwise construct the standard watchlist endpoint
+        const watchlistUrl = widgetData.watchlistAction
+            ? `${BASE_URL}${widgetData.watchlistAction}`
+            : `${BASE_URL}/s/film:${widgetData.filmId}/watchlist/`;
+
+        const result = await page.evaluate(async (url, csrf) => {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({ __csrf: csrf }),
+            });
+            return { status: res.status, body: await res.text() };
+        }, watchlistUrl, widgetData.csrf);
+
+        console.log(`[puppeteer] watchlist response: ${result.status} ${result.body.slice(0, 150)}`);
+        await page.close();
+
+        if (result.status === 200) {
+            let parsed;
+            try { parsed = JSON.parse(result.body); } catch {}
+            if (parsed?.result === true || parsed?.watchlisted === true) {
+                // Invalidate watchlist cache so it refreshes next time
+                cache.delete(`watchlist:${process.env.LETTERBOXD_USERNAME}`);
+                return { success: true };
+            } else {
+                return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
+            }
+        } else {
+            if (result.status === 403) browserLoggedIn = false;
+            return { success: false, error: `HTTP ${result.status}` };
+        }
+    } catch (err) {
+        if (page) await page.close().catch(() => {});
+        return { success: false, error: err.message };
+    }
+}
+
 // ── Resolve slug from IMDB ID via Puppeteer ───────────────────────────────────
 // Used as fallback for films outside the watchlist.
 // Letterboxd redirects /film/imdb/{imdbId}/ to the correct film page.
@@ -416,4 +503,4 @@ async function resolveSlugFromImdbViaPuppeteer(imdbId) {
     }
 }
 
-module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };
+module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, addToWatchlist, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };

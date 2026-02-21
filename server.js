@@ -4,7 +4,7 @@ const { addonBuilder } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { getWatchlist, getFilmMeta, rateFilm, hasSession, resolveSlugFromImdbViaPuppeteer } = require('./letterboxd');
+const { getWatchlist, getFilmMeta, rateFilm, addToWatchlist, hasSession, resolveSlugFromImdbViaPuppeteer } = require('./letterboxd');
 
 const USERNAME = process.env.LETTERBOXD_USERNAME || 'snuffalobill';
 const PORT = process.env.PORT || 7000;
@@ -113,12 +113,19 @@ builder.defineStreamHandler(({ type, id }) => {
     let baseUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
     if (baseUrl && !baseUrl.startsWith('http')) baseUrl = `https://${baseUrl}`;
 
-    // Return rating buttons instantly — no async work, no Puppeteer, no timeouts.
-    const streams = STAR_OPTIONS.map(opt => ({
-        name: 'Rate on Letterboxd',
-        description: opt.label,
-        url: `${baseUrl}/rate/${encodeURIComponent(id)}/${encodeURIComponent(opt.stars)}`,
-    }));
+    // Return rating buttons + watchlist button instantly.
+    const streams = [
+        {
+            name: '📋 Letterboxio',
+            description: 'Add to Letterboxd Watchlist',
+            url: `${baseUrl}/watchlist/${encodeURIComponent(id)}`,
+        },
+        ...STAR_OPTIONS.map(opt => ({
+            name: 'Rate on Letterboxd',
+            description: opt.label,
+            url: `${baseUrl}/rate/${encodeURIComponent(id)}/${encodeURIComponent(opt.stars)}`,
+        })),
+    ];
 
     return Promise.resolve({ streams });
 });
@@ -193,6 +200,31 @@ app.get('/rate/:imdbId/:stars', (req, res) => {
         enqueueRating(slug, stars);
     }).catch(err => {
         console.error(`[rate] Slug resolve error:`, err.message);
+    });
+});
+
+// ── /watchlist endpoint ───────────────────────────────────────────────────────
+
+app.get('/watchlist/:imdbId', (req, res) => {
+    const { imdbId } = req.params;
+    console.log(`[watchlist] ${imdbId}`);
+
+    serveM3U8(res);
+
+    if (!hasSession()) {
+        console.error('[watchlist] No session configured');
+        return;
+    }
+
+    if (!deduplicateRating(imdbId, 'watchlist')) return;
+
+    resolveSlugFromImdb(imdbId).then(slug => {
+        if (!slug) { console.error(`[watchlist] Could not resolve slug for ${imdbId}`); return; }
+        return addToWatchlist(slug).then(result => {
+            console.log(`[watchlist] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
+        });
+    }).catch(err => {
+        console.error(`[watchlist] Error:`, err.message);
     });
 });
 
