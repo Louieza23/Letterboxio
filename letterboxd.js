@@ -151,11 +151,20 @@ async function getUserRating(username, slug) {
         const filmUrl = `${BASE_URL}/film/${slug}/`;
         await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-        // Letterboxd renders the logged-in user's rating as e.g. <span class="rating rated-8">
-        // where rated-N maps to N/2 stars (1–10 → 0.5–5)
+        // The user's personal rating lives inside the #film-rating-widget,
+        // specifically on the div.rateit element's data-rateit-value attribute
+        // (1–10 scale, divide by 2 for stars) OR as a span.rating.rated-N inside
+        // the aside#sidebar .your-rating section.
         const ratingClass = await page.evaluate(() => {
-            const el = document.querySelector('span.rating[class*="rated-"]');
-            return el ? el.className : null;
+            // Most reliable: the rateit widget stores the current value in data-rateit-value
+            const rateit = document.querySelector('#film-rating-widget div.rateit[data-rateit-value]');
+            if (rateit) {
+                const val = rateit.getAttribute('data-rateit-value');
+                if (val && val !== '0') return `rateit:${val}`;
+            }
+            // Fallback: span.rating inside the user's own rating section (not community)
+            const userSection = document.querySelector('.your-rating span.rating[class*="rated-"], #film-rating-widget span.rating[class*="rated-"]');
+            return userSection ? userSection.className : null;
         });
 
         await page.close();
@@ -165,13 +174,17 @@ async function getUserRating(username, slug) {
             return null;
         }
 
-        const match = ratingClass.match(/rated-(\d+)/);
-        if (!match) {
-            setCache(cacheKey, null, 5 * 60 * 1000);
-            return null;
+        let stars;
+        if (ratingClass.startsWith('rateit:')) {
+            // data-rateit-value is on a 1–10 scale
+            const val = parseInt(ratingClass.slice(7), 10);
+            if (!val) { setCache(cacheKey, null, 5 * 60 * 1000); return null; }
+            stars = val / 2;
+        } else {
+            const match = ratingClass.match(/rated-(\d+)/);
+            if (!match) { setCache(cacheKey, null, 5 * 60 * 1000); return null; }
+            stars = parseInt(match[1], 10) / 2; // e.g. rated-8 → 4 stars
         }
-
-        const stars = parseInt(match[1], 10) / 2; // e.g. rated-8 → 4 stars
         setCache(cacheKey, stars, 5 * 60 * 1000);
         console.log(`[getUserRating] ${username}/${slug}: ${stars} stars`);
         return stars;
