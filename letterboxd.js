@@ -263,18 +263,20 @@ async function ensureBrowserLoggedIn() {
     try {
         console.log('[puppeteer] Logging in to Letterboxd...');
 
-        // networkidle2 gives Cloudflare's JS challenge time to complete.
-        // 60s timeout — login is only done once per container lifetime.
-        await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'networkidle2', timeout: 60000 });
+        // domcontentloaded fires quickly; Cloudflare challenge (if any) runs as JS
+        // after this. We then waitForSelector with a long timeout — it will wait
+        // until the challenge clears and the real login form appears.
+        await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Wait for the login form — confirms Cloudflare challenge is done
-        await page.waitForSelector('input[name="username"]', { timeout: 30000 });
+        // This is the key wait — up to 45s for Cloudflare challenge to resolve
+        // and the actual username input to appear in the DOM.
+        await page.waitForSelector('input[name="username"]', { timeout: 45000 });
 
         await page.type('input[name="username"]', username, { delay: 50 });
         await page.type('input[name="password"]', password, { delay: 50 });
 
         await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }),
+            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
             page.click('input[type="submit"], button[type="submit"]'),
         ]);
 
