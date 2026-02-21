@@ -175,24 +175,31 @@ app.get('/stream/:type/:id.json', async (req, res) => {
 // Stremio "plays" this URL when the user selects a rating.
 // We do the rating, then return a minimal M3U8 so Stremio closes cleanly.
 
-app.get('/rate/:imdbId/:stars', async (req, res) => {
+app.get('/rate/:imdbId/:stars', (req, res) => {
     const { imdbId, stars } = req.params;
     console.log(`[rate] ${imdbId} → ${stars} stars`);
 
+    // Respond immediately so Stremio closes the popup right away.
+    // The actual rating happens in the background.
+    serveM3U8(res);
+
     if (!hasSession()) {
         console.error('[rate] No session cookies set in .env');
-        return serveM3U8(res);
+        return;
     }
 
-    const slug = await resolveSlugFromImdb(imdbId);
-    if (!slug) {
-        console.error(`[rate] Could not resolve slug for ${imdbId}`);
-        return serveM3U8(res);
-    }
-
-    const result = await rateFilm(slug, stars);
-    console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
-    serveM3U8(res);
+    // Fire and forget — don't block the response
+    resolveSlugFromImdb(imdbId).then(slug => {
+        if (!slug) {
+            console.error(`[rate] Could not resolve slug for ${imdbId}`);
+            return;
+        }
+        return rateFilm(slug, stars);
+    }).then(result => {
+        if (result) console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
+    }).catch(err => {
+        console.error(`[rate] Error:`, err.message);
+    });
 });
 
 // ── /noop endpoint ────────────────────────────────────────────────────────────
