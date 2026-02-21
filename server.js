@@ -106,7 +106,8 @@ builder.defineStreamHandler(({ type, id }) => {
 
     console.log(`[stream] Rating streams requested for ${id}`);
 
-    const baseUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+    let baseUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+    if (baseUrl && !baseUrl.startsWith('http')) baseUrl = `https://${baseUrl}`;
 
     // Return rating buttons instantly — no async work, no Puppeteer, no timeouts.
     const streams = [
