@@ -400,32 +400,35 @@ async function rateFilm(slug, starRating) {
     }
 }
 
-// ── Add to watchlist (via Puppeteer) ─────────────────────────────────────────
+// ── Watchlist helpers ─────────────────────────────────────────────────────────
+// Both add and remove use POST to the same endpoint — Letterboxd treats it as
+// a toggle, but the response includes a `watchlisted` boolean we can check.
+// To force a specific direction we pass `remove=1` for removal.
+
+async function getFilmId(slug) {
+    try {
+        const res = await axios.get(`${BASE_URL}/film/${slug}/`, {
+            headers: BASE_HEADERS,
+            timeout: 10000,
+        });
+        const $ = cheerio.load(res.data);
+        return $('[data-film-id]').first().attr('data-film-id')
+            || $('body').attr('data-film-id')
+            || null;
+    } catch {
+        return null;
+    }
+}
 
 async function addToWatchlist(slug) {
     try {
         await ensureBrowserLoggedIn();
-
-        // Get filmId via axios (lightweight, no Puppeteer page navigation)
-        let filmId = null;
-        try {
-            const res = await axios.get(`${BASE_URL}/film/${slug}/`, {
-                headers: BASE_HEADERS,
-                timeout: 10000,
-            });
-            const $ = cheerio.load(res.data);
-            filmId = $('[data-film-id]').first().attr('data-film-id')
-                || $('body').attr('data-film-id');
-        } catch {}
-
-        if (!filmId) {
-            return { success: false, error: `Could not find film ID for ${slug}` };
-        }
+        const filmId = await getFilmId(slug);
+        if (!filmId) return { success: false, error: `Could not find film ID for ${slug}` };
 
         console.log(`[puppeteer] Adding film:${filmId} (${slug}) to watchlist`);
         const result = await puppeteerPost(`${BASE_URL}/s/film:${filmId}/watchlist/`, {});
-
-        console.log(`[puppeteer] watchlist response: ${result.status} ${result.body.slice(0, 150)}`);
+        console.log(`[puppeteer] watchlist add response: ${result.status} ${result.body.slice(0, 150)}`);
 
         if (result.status === 200) {
             let parsed;
@@ -433,13 +436,39 @@ async function addToWatchlist(slug) {
             if (parsed?.result === true || parsed?.watchlisted === true) {
                 cache.delete(`watchlist:${process.env.LETTERBOXD_USERNAME}`);
                 return { success: true };
-            } else {
-                return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
             }
-        } else {
-            if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
-            return { success: false, error: `HTTP ${result.status}` };
+            return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
         }
+        if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
+        return { success: false, error: `HTTP ${result.status}` };
+    } catch (err) {
+        return { success: false, error: err.message };
+    }
+}
+
+async function removeFromWatchlist(slug) {
+    try {
+        await ensureBrowserLoggedIn();
+        const filmId = await getFilmId(slug);
+        if (!filmId) return { success: false, error: `Could not find film ID for ${slug}` };
+
+        console.log(`[puppeteer] Removing film:${filmId} (${slug}) from watchlist`);
+        // POST with remove=1 explicitly removes rather than toggling
+        const result = await puppeteerPost(`${BASE_URL}/s/film:${filmId}/watchlist/`, { remove: '1' });
+        console.log(`[puppeteer] watchlist remove response: ${result.status} ${result.body.slice(0, 150)}`);
+
+        if (result.status === 200) {
+            let parsed;
+            try { parsed = JSON.parse(result.body); } catch {}
+            // watchlisted:false means it was successfully removed
+            if (parsed?.result === true || parsed?.watchlisted === false) {
+                cache.delete(`watchlist:${process.env.LETTERBOXD_USERNAME}`);
+                return { success: true };
+            }
+            return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
+        }
+        if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
+        return { success: false, error: `HTTP ${result.status}` };
     } catch (err) {
         return { success: false, error: err.message };
     }
@@ -502,4 +531,4 @@ async function resolveSlugFromImdbViaPuppeteer(imdbId) {
     return null;
 }
 
-module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, addToWatchlist, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };
+module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, addToWatchlist, removeFromWatchlist, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };
