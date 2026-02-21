@@ -117,34 +117,66 @@ async function getFilmMeta(slug) {
     }
 }
 
-// ── User's existing rating (public profile scrape, no login needed) ──────────
+// ── User's existing rating (via logged-in Puppeteer session) ─────────────────
+// The URL /{username}/film/{slug}/ does NOT exist on Letterboxd (404).
+// The user's personal rating is shown on /film/{slug}/ only when logged in.
+// So we reuse the existing Puppeteer session (already logged in) to scrape it.
 
 async function getUserRating(username, slug) {
     const cacheKey = `userrating:${username}:${slug}`;
     const cached = getCache(cacheKey);
     if (cached !== null) return cached;
 
-    try {
-        const url = `${BASE_URL}/${username}/film/${slug}/`;
-        const res = await axios.get(url, { headers: BASE_HEADERS, timeout: 8000 });
-        const $ = cheerio.load(res.data);
+    // If no session configured, skip silently
+    if (!hasSession()) {
+        setCache(cacheKey, null, 5 * 60 * 1000);
+        return null;
+    }
 
-        // Letterboxd renders the user's rating as e.g. <span class="rating rated-8">
+    let page;
+    try {
+        const b = await ensureBrowserLoggedIn();
+        page = await b.newPage();
+
+        // Block images/styles/fonts to save memory
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        const filmUrl = `${BASE_URL}/film/${slug}/`;
+        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+        // Letterboxd renders the logged-in user's rating as e.g. <span class="rating rated-8">
         // where rated-N maps to N/2 stars (1–10 → 0.5–5)
-        const ratingEl = $('span.rating[class*="rated-"]');
-        if (!ratingEl.length) {
+        const ratingClass = await page.evaluate(() => {
+            const el = document.querySelector('span.rating[class*="rated-"]');
+            return el ? el.className : null;
+        });
+
+        await page.close();
+
+        if (!ratingClass) {
             setCache(cacheKey, null, 5 * 60 * 1000);
             return null;
         }
-        const match = (ratingEl.attr('class') || '').match(/rated-(\d+)/);
+
+        const match = ratingClass.match(/rated-(\d+)/);
         if (!match) {
             setCache(cacheKey, null, 5 * 60 * 1000);
             return null;
         }
+
         const stars = parseInt(match[1], 10) / 2; // e.g. rated-8 → 4 stars
         setCache(cacheKey, stars, 5 * 60 * 1000);
+        console.log(`[getUserRating] ${username}/${slug}: ${stars} stars`);
         return stars;
     } catch (err) {
+        if (page) await page.close().catch(() => {});
         console.error(`[getUserRating] ${username}/${slug}:`, err.message);
         return null;
     }
