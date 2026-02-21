@@ -70,7 +70,9 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
                         id: meta.imdbId,
                         type: 'movie',
                         name: film.title,
-                        poster: meta.poster,
+                        // MetaHub is the standard Stremio poster CDN used by Cinemeta
+                        // and all major addons — serves proper portrait posters by IMDB ID
+                        poster: `https://images.metahub.space/poster/medium/${meta.imdbId}/img`,
                         year: meta.year ? parseInt(meta.year) : undefined,
                         description: meta.description,
                     };
