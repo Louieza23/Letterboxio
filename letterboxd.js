@@ -300,15 +300,34 @@ async function ensureBrowserLoggedIn() {
 }
 
 // Make a POST to a Letterboxd API endpoint using the session cookies from
-// the logged-in Puppeteer browser — no page navigation needed.
+// the logged-in Puppeteer browser.
+// IMPORTANT: fetch() with credentials: 'include' only works from a same-origin
+// page. We navigate to letterboxd.com first so cookies are sent correctly.
 async function puppeteerPost(url, body) {
     const b = await ensureBrowserLoggedIn();
     if (!sessionCsrf) throw new Error('No CSRF token — login may have failed');
 
-    // Use a blank page to run fetch() in the browser context (has session cookies)
     const page = await b.newPage();
     try {
-        await page.goto('about:blank');
+        // Block heavy resources — we only need the DOM to exist so fetch() runs
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
+        // Navigate to letterboxd.com so fetch() runs from the correct origin
+        // and session cookies are included automatically.
+        // 'commit' fires as soon as the response starts — we don't need to wait
+        // for the page to actually render, just for the origin to be established.
+        await page.goto(`${BASE_URL}/`, {
+            waitUntil: 'commit',
+            timeout: 20000,
+        });
+
         const result = await page.evaluate(async (url, body) => {
             const res = await fetch(url, {
                 method: 'POST',
@@ -318,6 +337,7 @@ async function puppeteerPost(url, body) {
             });
             return { status: res.status, body: await res.text() };
         }, url, new URLSearchParams({ ...body, __csrf: sessionCsrf }).toString());
+
         return result;
     } finally {
         await page.close();
