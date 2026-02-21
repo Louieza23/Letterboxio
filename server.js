@@ -175,7 +175,6 @@ app.get('/rate/:imdbId/:stars', (req, res) => {
     console.log(`[rate] ${imdbId} → ${stars} stars`);
 
     // Respond immediately so Stremio closes the popup right away.
-    // The actual rating happens in the background.
     serveM3U8(res);
 
     if (!hasSession()) {
@@ -183,17 +182,15 @@ app.get('/rate/:imdbId/:stars', (req, res) => {
         return;
     }
 
-    // Fire and forget — don't block the response
+    // Deduplicate — Android TV fires the same request 3-4x simultaneously
+    if (!deduplicateRating(imdbId, stars)) return;
+
+    // Resolve slug then enqueue (one Puppeteer page at a time)
     resolveSlugFromImdb(imdbId).then(slug => {
-        if (!slug) {
-            console.error(`[rate] Could not resolve slug for ${imdbId}`);
-            return;
-        }
-        return rateFilm(slug, stars);
-    }).then(result => {
-        if (result) console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
+        if (!slug) { console.error(`[rate] Could not resolve slug for ${imdbId}`); return; }
+        enqueueRating(slug, stars);
     }).catch(err => {
-        console.error(`[rate] Error:`, err.message);
+        console.error(`[rate] Slug resolve error:`, err.message);
     });
 });
 
@@ -202,6 +199,44 @@ app.get('/rate/:imdbId/:stars', (req, res) => {
 app.get('/noop', (req, res) => {
     serveM3U8(res);
 });
+
+// ── Rating deduplication & queue ──────────────────────────────────────────────
+// Android TV fires the same rating request 3-4 times simultaneously.
+// We deduplicate by ignoring requests for the same film within 5 seconds,
+// and queue rating jobs so only one Puppeteer page runs at a time.
+
+const recentRatings = new Map(); // imdbId → timestamp of last accepted rating
+const ratingQueue = [];          // pending { slug, stars } jobs
+let ratingRunning = false;
+
+function deduplicateRating(imdbId, stars) {
+    const key = `${imdbId}:${stars}`;
+    const last = recentRatings.get(key);
+    if (last && Date.now() - last < 5000) {
+        console.log(`[rate] Duplicate ignored for ${key}`);
+        return false; // duplicate
+    }
+    recentRatings.set(key, Date.now());
+    return true;
+}
+
+function enqueueRating(slug, stars) {
+    ratingQueue.push({ slug, stars });
+    if (!ratingRunning) processRatingQueue();
+}
+
+async function processRatingQueue() {
+    if (ratingQueue.length === 0) { ratingRunning = false; return; }
+    ratingRunning = true;
+    const { slug, stars } = ratingQueue.shift();
+    try {
+        const result = await rateFilm(slug, stars);
+        console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
+    } catch (err) {
+        console.error(`[rate] Queue error:`, err.message);
+    }
+    processRatingQueue(); // process next
+}
 
 // ── Slug resolution ───────────────────────────────────────────────────────────
 
