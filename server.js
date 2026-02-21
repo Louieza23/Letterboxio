@@ -281,9 +281,9 @@ app.listen(PORT, () => {
     console.log(`Letterboxd user: ${USERNAME}`);
     console.log(`Session cookies: ${hasSession() ? 'YES' : 'NO — rating will not work'}\n`);
 
-    // Pre-warm the slug cache on startup so ratings work immediately
-    // without waiting for the catalog to be opened first
-    getWatchlist(USERNAME).then(async films => {
+    // Pre-warm the slug cache after a delay so it doesn't compete with
+    // Puppeteer's first login attempt for memory
+    setTimeout(() => getWatchlist(USERNAME).then(async films => {
         console.log(`[startup] Pre-warming slug cache for ${films.length} films...`);
         // Low concurrency at startup to avoid memory spikes
         const CONCURRENCY = 2;
@@ -299,5 +299,5 @@ app.listen(PORT, () => {
             await new Promise(r => setTimeout(r, 100));
         }
         console.log(`[startup] Slug cache ready (${imdbToSlugCache.size} entries)`);
-    }).catch(err => console.error('[startup] Cache warm failed:', err.message));
+    }).catch(err => console.error('[startup] Cache warm failed:', err.message)), 60000); // 60s delay
 });

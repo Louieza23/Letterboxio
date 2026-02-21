@@ -261,7 +261,7 @@ async function ensureBrowserLoggedIn() {
     const page = await b.newPage();
     try {
         console.log('[puppeteer] Logging in to Letterboxd...');
-        await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
         // Wait for the form to be present (also handles Cloudflare challenge delay)
         await page.waitForSelector('input[name="username"]', { timeout: 20000 });
@@ -313,14 +313,14 @@ async function rateFilm(slug, starRating) {
 
         const filmUrl = `${BASE_URL}/film/${slug}/`;
         console.log(`[puppeteer] Navigating to ${filmUrl}`);
-        await page.goto(filmUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
         // Check if Cloudflare served a challenge page instead of the real page
         const pageTitle = await page.title();
         if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
             console.log(`[puppeteer] Cloudflare challenge detected, waiting...`);
             await new Promise(r => setTimeout(r, 5000));
-            await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
         }
 
         // Wait for the rateit widget to render and grab its data attributes
