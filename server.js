@@ -191,16 +191,15 @@ app.get('/rate/:imdbId/:stars', (req, res) => {
         return;
     }
 
-    // Deduplicate — Android TV fires the same request 3-4x simultaneously
     if (!deduplicateRating(imdbId, stars)) return;
 
-    // Resolve slug then enqueue (one Puppeteer page at a time)
     resolveSlugFromImdb(imdbId).then(slug => {
         if (!slug) { console.error(`[rate] Could not resolve slug for ${imdbId}`); return; }
-        enqueueRating(slug, stars);
-    }).catch(err => {
-        console.error(`[rate] Slug resolve error:`, err.message);
-    });
+        enqueuePuppeteer(async () => {
+            const result = await rateFilm(slug, stars);
+            console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
+        });
+    }).catch(err => console.error(`[rate] Slug resolve error:`, err.message));
 });
 
 // ── /watchlist endpoint ───────────────────────────────────────────────────────
@@ -220,12 +219,11 @@ app.get('/watchlist/:imdbId', (req, res) => {
 
     resolveSlugFromImdb(imdbId).then(slug => {
         if (!slug) { console.error(`[watchlist] Could not resolve slug for ${imdbId}`); return; }
-        return addToWatchlist(slug).then(result => {
+        enqueuePuppeteer(async () => {
+            const result = await addToWatchlist(slug);
             console.log(`[watchlist] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
         });
-    }).catch(err => {
-        console.error(`[watchlist] Error:`, err.message);
-    });
+    }).catch(err => console.error(`[watchlist] Error:`, err.message));
 });
 
 // ── /noop endpoint ────────────────────────────────────────────────────────────
@@ -239,37 +237,36 @@ app.get('/noop', (req, res) => {
 // We deduplicate by ignoring requests for the same film within 5 seconds,
 // and queue rating jobs so only one Puppeteer page runs at a time.
 
-const recentRatings = new Map(); // imdbId → timestamp of last accepted rating
-const ratingQueue = [];          // pending { slug, stars } jobs
-let ratingRunning = false;
+const recentRatings = new Map(); // key → timestamp of last accepted request
+const puppeteerQueue = [];       // pending { fn } jobs — one Puppeteer page at a time
+let puppeteerRunning = false;
 
-function deduplicateRating(imdbId, stars) {
-    const key = `${imdbId}:${stars}`;
+function deduplicateRating(imdbId, action) {
+    const key = `${imdbId}:${action}`;
     const last = recentRatings.get(key);
     if (last && Date.now() - last < 5000) {
-        console.log(`[rate] Duplicate ignored for ${key}`);
-        return false; // duplicate
+        console.log(`[dedup] Duplicate ignored for ${key}`);
+        return false;
     }
     recentRatings.set(key, Date.now());
     return true;
 }
 
-function enqueueRating(slug, stars) {
-    ratingQueue.push({ slug, stars });
-    if (!ratingRunning) processRatingQueue();
+function enqueuePuppeteer(fn) {
+    puppeteerQueue.push(fn);
+    if (!puppeteerRunning) processPuppeteerQueue();
 }
 
-async function processRatingQueue() {
-    if (ratingQueue.length === 0) { ratingRunning = false; return; }
-    ratingRunning = true;
-    const { slug, stars } = ratingQueue.shift();
+async function processPuppeteerQueue() {
+    if (puppeteerQueue.length === 0) { puppeteerRunning = false; return; }
+    puppeteerRunning = true;
+    const fn = puppeteerQueue.shift();
     try {
-        const result = await rateFilm(slug, stars);
-        console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
+        await fn();
     } catch (err) {
-        console.error(`[rate] Queue error:`, err.message);
+        console.error(`[queue] Error:`, err.message);
     }
-    processRatingQueue(); // process next
+    processPuppeteerQueue();
 }
 
 // ── Slug resolution ───────────────────────────────────────────────────────────
