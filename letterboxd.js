@@ -105,8 +105,20 @@ async function getFilmMeta(slug) {
         });
 
         const year = $('meta[property="og:title"]').attr('content')?.match(/\((\d{4})\)/)?.[1] || null;
-        const poster = $('meta[property="og:image"]').attr('content') || null;
         const description = $('meta[property="og:description"]').attr('content') || null;
+
+        // Prefer the portrait poster from the film-poster div (proper 2:3 ratio for Stremio).
+        // Fall back to og:image (landscape crop) if not found.
+        let poster = $('div.film-poster img').attr('src') || null;
+        if (!poster || poster.includes('empty-poster')) {
+            poster = $('meta[property="og:image"]').attr('content') || null;
+        }
+        // Convert Letterboxd thumbnail URLs to full-size portrait poster
+        // e.g. /resized/...230-345... → strip resized path to get the original
+        if (poster && poster.includes('a.ltrbxd.com/resized/')) {
+            // Try to get a larger version by replacing crop dimensions
+            poster = poster.replace(/-\d+-\d+-\d+-\d+-crop-[^.]+/, '');
+        }
 
         const meta = { imdbId, year, poster, description };
         setCache(cacheKey, meta, 24 * 60 * 60 * 1000); // 24 hours

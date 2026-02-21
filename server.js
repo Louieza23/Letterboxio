@@ -23,7 +23,7 @@ const manifest = {
         {
             id: 'letterboxd-watchlist',
             type: 'movie',
-            name: `${USERNAME}'s Watchlist`,
+            name: 'Letterboxd Watchlist',
             extra: [{ name: 'skip', isRequired: false }],
         },
     ],
@@ -110,18 +110,11 @@ builder.defineStreamHandler(({ type, id }) => {
     if (baseUrl && !baseUrl.startsWith('http')) baseUrl = `https://${baseUrl}`;
 
     // Return rating buttons instantly — no async work, no Puppeteer, no timeouts.
-    const streams = [
-        {
-            name: 'Letterboxio',
-            description: 'Rate this film on Letterboxd',
-            url: `${baseUrl}/noop`,
-        },
-        ...STAR_OPTIONS.map(opt => ({
-            name: 'Rate on Letterboxd',
-            description: opt.label,
-            url: `${baseUrl}/rate/${encodeURIComponent(id)}/${encodeURIComponent(opt.stars)}`,
-        })),
-    ];
+    const streams = STAR_OPTIONS.map(opt => ({
+        name: 'Rate on Letterboxd',
+        description: opt.label,
+        url: `${baseUrl}/rate/${encodeURIComponent(id)}/${encodeURIComponent(opt.stars)}`,
+    }));
 
     return Promise.resolve({ streams });
 });
