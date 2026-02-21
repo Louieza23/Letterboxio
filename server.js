@@ -66,6 +66,8 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
                 try {
                     const meta = await getFilmMeta(film.slug);
                     if (!meta.imdbId) return null;
+                    // Cache the slug↔imdbId mapping so /rate works immediately
+                    imdbToSlugCache.set(meta.imdbId, film.slug);
                     return {
                         id: meta.imdbId,
                         type: 'movie',
@@ -245,7 +247,7 @@ const imdbToSlugCache = new Map();
 async function resolveSlugFromImdb(imdbId) {
     if (imdbToSlugCache.has(imdbId)) return imdbToSlugCache.get(imdbId);
 
-    // Check watchlist cache first (fast, no extra requests if catalog already loaded)
+    // Search watchlist cache (slug cache is pre-warmed at startup)
     try {
         const watchlist = await getWatchlist(USERNAME);
         for (const film of watchlist) {
@@ -257,23 +259,9 @@ async function resolveSlugFromImdb(imdbId) {
         }
     } catch {}
 
-    // Fall back to Letterboxd search by IMDB id
-    try {
-        const res = await axios.get(`https://letterboxd.com/search/films/${imdbId}/`, {
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-            timeout: 10000,
-        });
-        const $ = cheerio.load(res.data);
-        const href = $('li.film-detail h2.film-title a').first().attr('href');
-        if (href) {
-            const slug = href.replace(/^\/film\//, '').replace(/\/$/, '');
-            imdbToSlugCache.set(imdbId, slug);
-            return slug;
-        }
-    } catch (err) {
-        console.error('[resolveSlug] search failed:', err.message);
-    }
-
+    // No slug found — film is not in watchlist and Letterboxd search is
+    // Cloudflare-blocked from server environments, so we can't resolve it.
+    console.error(`[resolveSlug] ${imdbId} not found in watchlist cache`);
     return null;
 }
 
@@ -291,4 +279,21 @@ app.listen(PORT, () => {
     console.log(`Add to Stremio: http://localhost:${PORT}/manifest.json\n`);
     console.log(`Letterboxd user: ${USERNAME}`);
     console.log(`Session cookies: ${hasSession() ? 'YES' : 'NO — rating will not work'}\n`);
+
+    // Pre-warm the slug cache on startup so ratings work immediately
+    // without waiting for the catalog to be opened first
+    getWatchlist(USERNAME).then(async films => {
+        console.log(`[startup] Pre-warming slug cache for ${films.length} films...`);
+        const CONCURRENCY = 5;
+        for (let i = 0; i < films.length; i += CONCURRENCY) {
+            const batch = films.slice(i, i + CONCURRENCY);
+            await Promise.all(batch.map(async film => {
+                try {
+                    const meta = await getFilmMeta(film.slug);
+                    if (meta.imdbId) imdbToSlugCache.set(meta.imdbId, film.slug);
+                } catch {}
+            }));
+        }
+        console.log(`[startup] Slug cache ready (${imdbToSlugCache.size} entries)`);
+    }).catch(err => console.error('[startup] Cache warm failed:', err.message));
 });
