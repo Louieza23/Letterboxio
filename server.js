@@ -4,7 +4,7 @@ const { addonBuilder } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { getWatchlist, getFilmMeta, rateFilm, hasSession } = require('./letterboxd');
+const { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession } = require('./letterboxd');
 
 const USERNAME = process.env.LETTERBOXD_USERNAME || 'snuffalobill';
 const PORT = process.env.PORT || 7000;
@@ -106,17 +106,38 @@ builder.defineStreamHandler(async ({ type, id }) => {
 
     console.log(`[stream] Rating streams requested for ${id}`);
 
-    const baseUrl = `http://localhost:${PORT}`;
+    const baseUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+
+    // Look up existing rating — resolve IMDB ID to slug first (cached after first call)
+    const slug = await resolveSlugFromImdb(id).catch(() => null);
+    let ratingDisplay = 'Not yet rated on Letterboxd';
+    if (slug) {
+        const rating = await getUserRating(USERNAME, slug).catch(() => null);
+        if (rating !== null) {
+            const full = Math.floor(rating);
+            const half = rating % 1 >= 0.5;
+            const stars = '★'.repeat(full) + (half ? '½' : '');
+            ratingDisplay = `Your rating: ${stars} (${rating} stars)`;
+        }
+    }
 
     const streams = [
-        // Header entry
+        // Current rating display (top, non-clickable)
+        {
+            name: 'Letterboxio',
+            description: ratingDisplay,
+            url: `${baseUrl}/noop`,
+            behaviorHints: { notWebReady: true },
+        },
+        // Separator / prompt
         {
             name: 'Letterboxio',
             description: 'Rate this film on Letterboxd',
             url: `${baseUrl}/noop`,
             behaviorHints: { notWebReady: true },
         },
-        // One stream per star rating
+        // One stream per star rating — Stremio "plays" this URL silently,
+        // our server does the rating and returns an empty M3U8 to end playback.
         ...STAR_OPTIONS.map(opt => ({
             name: 'Rate on Letterboxd',
             description: opt.label,

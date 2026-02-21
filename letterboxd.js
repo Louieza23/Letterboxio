@@ -117,6 +117,39 @@ async function getFilmMeta(slug) {
     }
 }
 
+// ── User's existing rating (public profile scrape, no login needed) ──────────
+
+async function getUserRating(username, slug) {
+    const cacheKey = `userrating:${username}:${slug}`;
+    const cached = getCache(cacheKey);
+    if (cached !== null) return cached;
+
+    try {
+        const url = `${BASE_URL}/${username}/film/${slug}/`;
+        const res = await axios.get(url, { headers: BASE_HEADERS, timeout: 8000 });
+        const $ = cheerio.load(res.data);
+
+        // Letterboxd renders the user's rating as e.g. <span class="rating rated-8">
+        // where rated-N maps to N/2 stars (1–10 → 0.5–5)
+        const ratingEl = $('span.rating[class*="rated-"]');
+        if (!ratingEl.length) {
+            setCache(cacheKey, null, 5 * 60 * 1000);
+            return null;
+        }
+        const match = (ratingEl.attr('class') || '').match(/rated-(\d+)/);
+        if (!match) {
+            setCache(cacheKey, null, 5 * 60 * 1000);
+            return null;
+        }
+        const stars = parseInt(match[1], 10) / 2; // e.g. rated-8 → 4 stars
+        setCache(cacheKey, stars, 5 * 60 * 1000);
+        return stars;
+    } catch (err) {
+        console.error(`[getUserRating] ${username}/${slug}:`, err.message);
+        return null;
+    }
+}
+
 // ── Rating (via Puppeteer) ────────────────────────────────────────────────────
 // We use a real headless browser to bypass Cloudflare's bot protection.
 // The browser is launched once and reused across rating calls.
@@ -135,7 +168,12 @@ async function getBrowser() {
     console.log('[puppeteer] Launching browser...');
     browser = await puppeteer.launch({
         headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage', // critical for Railway/Docker containers
+            '--disable-gpu',
+        ],
     });
     browserLoggedIn = false;
     console.log('[puppeteer] Browser ready');
@@ -195,6 +233,16 @@ async function rateFilm(slug, starRating) {
         const b = await ensureBrowserLoggedIn();
         page = await b.newPage();
 
+        // Block images/styles/fonts to reduce memory usage on Railway's 512MB container
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+
         const filmUrl = `${BASE_URL}/film/${slug}/`;
         console.log(`[puppeteer] Navigating to ${filmUrl}`);
         await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -238,6 +286,7 @@ async function rateFilm(slug, starRating) {
             try { parsed = JSON.parse(result.body); } catch {}
             if (parsed?.result === true) {
                 cache.delete(`rating:${slug}`);
+                cache.delete(`userrating:${process.env.LETTERBOXD_USERNAME}:${slug}`);
                 return { success: true };
             } else {
                 return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
@@ -254,4 +303,4 @@ async function rateFilm(slug, starRating) {
     }
 }
 
-module.exports = { getWatchlist, getFilmMeta, rateFilm, hasSession };
+module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession };
