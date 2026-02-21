@@ -462,35 +462,40 @@ async function resolveSlugFromImdbViaPuppeteer(imdbId) {
             validateStatus: s => s < 500,
         });
         // After following redirects, the final URL is in res.request.res.responseUrl
-        const finalUrl = res.request?.res?.responseUrl || res.config?.url || '';
+        const responseUrl = res.request?.res?.responseUrl || '';
+        const configUrl = res.config?.url || '';
+        const statusCode = res.status;
+        console.log(`[resolveSlug] ${imdbId} axios status=${statusCode} responseUrl="${responseUrl}" configUrl="${configUrl}"`);
+
+        const finalUrl = responseUrl || configUrl;
         const match = finalUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
         if (match && match[1] !== 'imdb') {
             console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via axios redirect)`);
             return match[1];
         }
-    } catch (err) {
-        console.warn(`[resolveSlug] axios redirect failed for ${imdbId}:`, err.message);
-    }
 
-    // Second try: scrape the film page HTML — Letterboxd includes the canonical
-    // slug in several places we can reliably extract it from.
-    try {
-        const res = await axios.get(`${BASE_URL}/film/imdb/${imdbId}/`, {
-            headers: BASE_HEADERS,
-            timeout: 10000,
-            maxRedirects: 5,
-            validateStatus: s => s < 500,
-        });
+        // If responseUrl didn't work, try og:url from the HTML
         const $ = cheerio.load(res.data);
-        // og:url is like https://letterboxd.com/film/violent-cop/
         const ogUrl = $('meta[property="og:url"]').attr('content') || '';
-        const match = ogUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
-        if (match && match[1] !== 'imdb') {
-            console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via og:url)`);
-            return match[1];
+        const bodySlug = $('body').attr('data-film-slug') || $('[data-film-slug]').first().attr('data-film-slug') || '';
+        console.log(`[resolveSlug] ${imdbId} og:url="${ogUrl}" data-film-slug="${bodySlug}"`);
+
+        const ogMatch = ogUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
+        if (ogMatch && ogMatch[1] !== 'imdb') {
+            console.log(`[resolveSlug] ${imdbId} → ${ogMatch[1]} (via og:url)`);
+            return ogMatch[1];
         }
+
+        if (bodySlug && bodySlug !== 'imdb') {
+            console.log(`[resolveSlug] ${imdbId} → ${bodySlug} (via data-film-slug)`);
+            return bodySlug;
+        }
+
+        // Log a snippet of the HTML so we can see what Letterboxd actually returned
+        console.warn(`[resolveSlug] ${imdbId} — no slug found. HTML snippet: ${res.data.slice(0, 300).replace(/\s+/g, ' ')}`);
+
     } catch (err) {
-        console.warn(`[resolveSlug] og:url scrape failed for ${imdbId}:`, err.message);
+        console.warn(`[resolveSlug] axios failed for ${imdbId}:`, err.message);
     }
 
     console.error(`[resolveSlug] Could not resolve slug for ${imdbId}`);
