@@ -4,7 +4,7 @@ const { addonBuilder } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { getWatchlist, getFilmMeta, rateFilm, hasSession } = require('./letterboxd');
+const { getWatchlist, getFilmMeta, rateFilm, hasSession, resolveSlugFromImdbViaPuppeteer } = require('./letterboxd');
 
 const USERNAME = process.env.LETTERBOXD_USERNAME || 'snuffalobill';
 const PORT = process.env.PORT || 7000;
@@ -259,10 +259,11 @@ async function resolveSlugFromImdb(imdbId) {
         }
     } catch {}
 
-    // No slug found — film is not in watchlist and Letterboxd search is
-    // Cloudflare-blocked from server environments, so we can't resolve it.
-    console.error(`[resolveSlug] ${imdbId} not found in watchlist cache`);
-    return null;
+    // Not in watchlist — fall back to Puppeteer which bypasses Cloudflare.
+    // Letterboxd redirects /film/imdb/{imdbId}/ to the correct film page.
+    const slug = await resolveSlugFromImdbViaPuppeteer(imdbId);
+    if (slug) imdbToSlugCache.set(imdbId, slug);
+    return slug;
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

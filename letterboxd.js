@@ -356,4 +356,41 @@ async function rateFilm(slug, starRating) {
     }
 }
 
-module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession, getFromCache: getCache };
+// ── Resolve slug from IMDB ID via Puppeteer ───────────────────────────────────
+// Used as fallback for films outside the watchlist.
+// Letterboxd redirects /film/imdb/{imdbId}/ to the correct film page.
+
+async function resolveSlugFromImdbViaPuppeteer(imdbId) {
+    let page;
+    try {
+        const b = await ensureBrowserLoggedIn();
+        page = await b.newPage();
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
+        });
+        await page.goto(`${BASE_URL}/film/imdb/${imdbId}/`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 20000,
+        });
+        const finalUrl = page.url();
+        await page.close();
+        // Final URL is like https://letterboxd.com/film/violent-cop/
+        const match = finalUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
+        if (match) {
+            console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via Puppeteer)`);
+            return match[1];
+        }
+        return null;
+    } catch (err) {
+        if (page) await page.close().catch(() => {});
+        console.error(`[resolveSlug] Puppeteer failed for ${imdbId}:`, err.message);
+        return null;
+    }
+}
+
+module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };
