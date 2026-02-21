@@ -4,7 +4,7 @@ const { addonBuilder } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession, getFromCache } = require('./letterboxd');
+const { getWatchlist, getFilmMeta, rateFilm, hasSession } = require('./letterboxd');
 
 const USERNAME = process.env.LETTERBOXD_USERNAME || 'snuffalobill';
 const PORT = process.env.PORT || 7000;
@@ -101,50 +101,20 @@ const STAR_OPTIONS = [
     { stars: '0.5', label: '½      0.5 stars' },
 ];
 
-builder.defineStreamHandler(async ({ type, id }) => {
-    if (type !== 'movie') return { streams: [] };
+builder.defineStreamHandler(({ type, id }) => {
+    if (type !== 'movie') return Promise.resolve({ streams: [] });
 
     console.log(`[stream] Rating streams requested for ${id}`);
 
     const baseUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
 
-    // Use only what's already cached — never block the stream response on Puppeteer.
-    // Stremio has a short timeout (~10s); a cold Puppeteer login takes 30s+.
-    // We kick off background fetches so the cache is warm on the next open.
-    const slug = imdbToSlugCache.get(id) || null;
-
-    let ratingDisplay = 'Not yet rated on Letterboxd';
-    if (slug) {
-        // Check cache directly — getCache is synchronous
-        const cachedRating = getFromCache(`userrating:${USERNAME}:${slug}`);
-        if (cachedRating !== null) {
-            const full = Math.floor(cachedRating);
-            const half = cachedRating % 1 >= 0.5;
-            const stars = '★'.repeat(full) + (half ? '½' : '');
-            ratingDisplay = `Your rating: ${stars} (${cachedRating} stars)`;
-        }
-    }
-
-    // Kick off background resolution so next open is fast (don't await)
-    resolveSlugFromImdb(id).then(s => {
-        if (s) getUserRating(USERNAME, s).catch(() => {});
-    }).catch(() => {});
-
+    // Return rating buttons instantly — no async work, no Puppeteer, no timeouts.
     const streams = [
-        // Current rating display (top, non-clickable)
-        {
-            name: 'Letterboxio',
-            description: ratingDisplay,
-            url: `${baseUrl}/noop`,
-        },
-        // Separator / prompt
         {
             name: 'Letterboxio',
             description: 'Rate this film on Letterboxd',
             url: `${baseUrl}/noop`,
         },
-        // One stream per star rating — Stremio "plays" this URL silently,
-        // our server does the rating and returns an empty M3U8 to end playback.
         ...STAR_OPTIONS.map(opt => ({
             name: 'Rate on Letterboxd',
             description: opt.label,
@@ -152,7 +122,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
         })),
     ];
 
-    return { streams };
+    return Promise.resolve({ streams });
 });
 
 // ── Express app ───────────────────────────────────────────────────────────────
