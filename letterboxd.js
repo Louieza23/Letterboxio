@@ -107,21 +107,17 @@ async function getFilmMeta(slug) {
         const year = $('meta[property="og:title"]').attr('content')?.match(/\((\d{4})\)/)?.[1] || null;
         const description = $('meta[property="og:description"]').attr('content') || null;
 
-        // Prefer the portrait poster from the film-poster div (proper 2:3 ratio for Stremio).
-        // Fall back to og:image (landscape crop) if not found.
-        let poster = $('div.film-poster img').attr('src') || null;
-        if (!poster || poster.includes('empty-poster')) {
-            poster = $('meta[property="og:image"]').attr('content') || null;
-        }
-        // Convert Letterboxd thumbnail URLs to full-size portrait poster
-        // e.g. /resized/...230-345... → strip resized path to get the original
+        // og:image is a landscape/square crop — convert to portrait by swapping
+        // the crop dimensions in the URL to Letterboxd's portrait size (230x345).
+        // e.g. gosford-park-1200-1200-675-675-crop-000000.jpg
+        //   →  gosford-park-0-230-0-345-crop-000000.jpg
+        let poster = $('meta[property="og:image"]').attr('content') || null;
         if (poster && poster.includes('a.ltrbxd.com/resized/')) {
-            // Try to get a larger version by replacing crop dimensions
-            poster = poster.replace(/-\d+-\d+-\d+-\d+-crop-[^.]+/, '');
+            poster = poster.replace(/-\d+-\d+-\d+-\d+-crop-([^.?]+)/, '-0-230-0-345-crop-$1');
         }
 
         const meta = { imdbId, year, poster, description };
-        setCache(cacheKey, meta, 24 * 60 * 60 * 1000); // 24 hours
+        setCache(cacheKey, meta, 6 * 60 * 60 * 1000); // 6 hours
         return meta;
     } catch (err) {
         console.error(`Error fetching meta for ${slug}:`, err.message);

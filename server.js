@@ -23,7 +23,7 @@ const manifest = {
         {
             id: 'letterboxd-watchlist',
             type: 'movie',
-            name: 'Letterboxd Watchlist',
+            name: 'Letterboxio Watchlist',
             extra: [{ name: 'skip', isRequired: false }],
         },
     ],
