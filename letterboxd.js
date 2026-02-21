@@ -215,6 +215,7 @@ const RATING_MAP = {
 
 let browser = null;
 let browserLoggedIn = false;
+let sessionCsrf = null; // CSRF token grabbed at login, reused for all requests
 
 async function getBrowser() {
     if (browser && browser.connected) return browser;
@@ -281,6 +282,14 @@ async function ensureBrowserLoggedIn() {
             throw new Error('Login failed — still on sign-in page. Check credentials in .env.');
         }
 
+        // Grab CSRF token once — it persists for the whole session
+        sessionCsrf = await page.evaluate(() =>
+            document.querySelector('input[name="__csrf"]')?.value
+            || document.querySelector('meta[name="csrf-token"]')?.content
+            || document.body?.getAttribute('data-csrf')
+        );
+        console.log(`[puppeteer] CSRF captured: ${sessionCsrf?.slice(0, 8)}...`);
+
         browserLoggedIn = true;
         console.log('[puppeteer] Login successful');
     } finally {
@@ -290,72 +299,64 @@ async function ensureBrowserLoggedIn() {
     return b;
 }
 
+// Make a POST to a Letterboxd API endpoint using the session cookies from
+// the logged-in Puppeteer browser — no page navigation needed.
+async function puppeteerPost(url, body) {
+    const b = await ensureBrowserLoggedIn();
+    if (!sessionCsrf) throw new Error('No CSRF token — login may have failed');
+
+    // Use a blank page to run fetch() in the browser context (has session cookies)
+    const page = await b.newPage();
+    try {
+        await page.goto('about:blank');
+        const result = await page.evaluate(async (url, body) => {
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body,
+                credentials: 'include',
+            });
+            return { status: res.status, body: await res.text() };
+        }, url, new URLSearchParams({ ...body, __csrf: sessionCsrf }).toString());
+        return result;
+    } finally {
+        await page.close();
+    }
+}
+
 async function rateFilm(slug, starRating) {
     const ratingValue = RATING_MAP[String(starRating)];
     if (!ratingValue) {
         return { success: false, error: `Invalid rating value: ${starRating}` };
     }
 
-    let page;
     try {
-        const b = await ensureBrowserLoggedIn();
-        page = await b.newPage();
+        await ensureBrowserLoggedIn();
 
-        // Block images/styles/fonts to reduce memory usage on Railway's 512MB container
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                req.abort();
-            } else {
-                req.continue();
-            }
-        });
+        // Get the film's Letterboxd ID from the watchlist cache (already fetched)
+        // or fall back to scraping the film page with axios (not Puppeteer)
+        const filmMeta = await getFilmMeta(slug);
+        let filmId = null;
 
-        const filmUrl = `${BASE_URL}/film/${slug}/`;
-        console.log(`[puppeteer] Navigating to ${filmUrl}`);
-        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        // Check if Cloudflare served a challenge page instead of the real page
-        const pageTitle = await page.title();
-        if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
-            console.log(`[puppeteer] Cloudflare challenge detected, waiting...`);
-            await new Promise(r => setTimeout(r, 5000));
-            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-        }
-
-        // Wait for the rateit widget to render and grab its data attributes
-        await page.waitForSelector('div.rateit[data-rate-action]', { timeout: 15000 });
-
-        const widgetData = await page.evaluate(() => {
-            const widget = document.querySelector('div.rateit[data-rate-action]');
-            // CSRF is available in multiple places; try all
-            const csrf = document.querySelector('input[name="__csrf"]')?.value
-                || document.querySelector('meta[name="csrf-token"]')?.content
-                || document.body.getAttribute('data-csrf');
-            return {
-                rateAction: widget?.getAttribute('data-rate-action'),
-                csrf,
-            };
-        });
-
-        console.log(`[puppeteer] rateAction=${widgetData.rateAction} csrf=${widgetData.csrf?.slice(0, 8)}...`);
-
-        if (!widgetData.rateAction) {
-            return { success: false, error: 'Could not find rating widget — may not be logged in' };
-        }
-
-        // POST directly to the rate endpoint discovered from the widget
-        const result = await page.evaluate(async (rateAction, csrf, ratingValue, baseUrl) => {
-            const res = await fetch(`${baseUrl}${rateAction}`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({ rating: ratingValue, __csrf: csrf }),
+        // Try to get filmId via axios from the film page (lightweight, no JS needed)
+        try {
+            const res = await axios.get(`${BASE_URL}/film/${slug}/`, {
+                headers: BASE_HEADERS,
+                timeout: 10000,
             });
-            return { status: res.status, body: await res.text() };
-        }, widgetData.rateAction, widgetData.csrf, ratingValue, BASE_URL);
+            const $ = cheerio.load(res.data);
+            filmId = $('[data-film-id]').first().attr('data-film-id')
+                || $('body').attr('data-film-id');
+        } catch {}
+
+        if (!filmId) {
+            return { success: false, error: `Could not find film ID for ${slug}` };
+        }
+
+        console.log(`[puppeteer] Rating film:${filmId} (${slug}) → ${ratingValue}`);
+        const result = await puppeteerPost(`${BASE_URL}/s/film:${filmId}/rate/`, { rating: ratingValue });
 
         console.log(`[puppeteer] rating response: ${result.status} ${result.body.slice(0, 150)}`);
-        await page.close();
 
         if (result.status === 200) {
             let parsed;
@@ -368,13 +369,13 @@ async function rateFilm(slug, starRating) {
                 return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
             }
         } else {
-            if (result.status === 403) browserLoggedIn = false;
+            if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
             return { success: false, error: `HTTP ${result.status}: ${result.body.slice(0, 100)}` };
         }
     } catch (err) {
-        if (page) await page.close().catch(() => {});
         browser = null;
         browserLoggedIn = false;
+        sessionCsrf = null;
         return { success: false, error: err.message };
     }
 }
@@ -382,86 +383,44 @@ async function rateFilm(slug, starRating) {
 // ── Add to watchlist (via Puppeteer) ─────────────────────────────────────────
 
 async function addToWatchlist(slug) {
-    let page;
     try {
-        const b = await ensureBrowserLoggedIn();
-        page = await b.newPage();
+        await ensureBrowserLoggedIn();
 
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                req.abort();
-            } else {
-                req.continue();
-            }
-        });
-
-        const filmUrl = `${BASE_URL}/film/${slug}/`;
-        console.log(`[puppeteer] Navigating to ${filmUrl} (watchlist)`);
-        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-
-        const pageTitle = await page.title();
-        if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
-            console.log(`[puppeteer] Cloudflare challenge detected, waiting...`);
-            await new Promise(r => setTimeout(r, 5000));
-            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-        }
-
-        // Grab the watchlist action URL and CSRF from the page
-        const widgetData = await page.evaluate(() => {
-            const csrf = document.querySelector('input[name="__csrf"]')?.value
-                || document.querySelector('meta[name="csrf-token"]')?.content
-                || document.body.getAttribute('data-csrf');
-            // Watchlist button has data-action pointing to the toggle endpoint
-            const btn = document.querySelector('[data-action*="watchlist"], .toggle-watchlist');
-            return {
-                watchlistAction: btn?.getAttribute('data-action') || btn?.getAttribute('data-watchlist-action'),
-                filmId: document.querySelector('[data-film-id]')?.getAttribute('data-film-id'),
-                csrf,
-            };
-        });
-
-        console.log(`[puppeteer] watchlistAction=${widgetData.watchlistAction} filmId=${widgetData.filmId}`);
-
-        if (!widgetData.csrf) {
-            await page.close();
-            return { success: false, error: 'Could not find CSRF token' };
-        }
-
-        // If we found a direct action URL, POST to it
-        // Otherwise construct the standard watchlist endpoint
-        const watchlistUrl = widgetData.watchlistAction
-            ? `${BASE_URL}${widgetData.watchlistAction}`
-            : `${BASE_URL}/s/film:${widgetData.filmId}/watchlist/`;
-
-        const result = await page.evaluate(async (url, csrf) => {
-            const res = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body: new URLSearchParams({ __csrf: csrf }),
+        // Get filmId via axios (lightweight, no Puppeteer page navigation)
+        let filmId = null;
+        try {
+            const res = await axios.get(`${BASE_URL}/film/${slug}/`, {
+                headers: BASE_HEADERS,
+                timeout: 10000,
             });
-            return { status: res.status, body: await res.text() };
-        }, watchlistUrl, widgetData.csrf);
+            const $ = cheerio.load(res.data);
+            filmId = $('[data-film-id]').first().attr('data-film-id')
+                || $('body').attr('data-film-id');
+        } catch {}
+
+        if (!filmId) {
+            return { success: false, error: `Could not find film ID for ${slug}` };
+        }
+
+        console.log(`[puppeteer] Adding film:${filmId} (${slug}) to watchlist`);
+        const result = await puppeteerPost(`${BASE_URL}/s/film:${filmId}/watchlist/`, {});
 
         console.log(`[puppeteer] watchlist response: ${result.status} ${result.body.slice(0, 150)}`);
-        await page.close();
 
         if (result.status === 200) {
             let parsed;
             try { parsed = JSON.parse(result.body); } catch {}
             if (parsed?.result === true || parsed?.watchlisted === true) {
-                // Invalidate watchlist cache so it refreshes next time
                 cache.delete(`watchlist:${process.env.LETTERBOXD_USERNAME}`);
                 return { success: true };
             } else {
                 return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
             }
         } else {
-            if (result.status === 403) browserLoggedIn = false;
+            if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
             return { success: false, error: `HTTP ${result.status}` };
         }
     } catch (err) {
-        if (page) await page.close().catch(() => {});
         return { success: false, error: err.message };
     }
 }
