@@ -445,41 +445,56 @@ async function addToWatchlist(slug) {
     }
 }
 
-// ── Resolve slug from IMDB ID via Puppeteer ───────────────────────────────────
-// Used as fallback for films outside the watchlist.
-// Letterboxd redirects /film/imdb/{imdbId}/ to the correct film page.
+// ── Resolve slug from IMDB ID ─────────────────────────────────────────────────
+// Letterboxd does a server-side redirect from /film/imdb/{imdbId}/ to the
+// correct film page. We follow that redirect with axios (no Puppeteer needed).
 
 async function resolveSlugFromImdbViaPuppeteer(imdbId) {
-    let page;
+    // First try: lightweight axios redirect follow (no Puppeteer, no RAM spike)
     try {
-        const b = await ensureBrowserLoggedIn();
-        page = await b.newPage();
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
-                req.abort();
-            } else {
-                req.continue();
-            }
+        const res = await axios.get(`${BASE_URL}/film/imdb/${imdbId}/`, {
+            headers: {
+                ...BASE_HEADERS,
+                'Accept': 'text/html',
+            },
+            timeout: 10000,
+            maxRedirects: 5,
+            validateStatus: s => s < 500,
         });
-        await page.goto(`${BASE_URL}/film/imdb/${imdbId}/`, {
-            waitUntil: 'domcontentloaded',
-            timeout: 20000,
-        });
-        const finalUrl = page.url();
-        await page.close();
-        // Final URL is like https://letterboxd.com/film/violent-cop/
+        // After following redirects, the final URL is in res.request.res.responseUrl
+        const finalUrl = res.request?.res?.responseUrl || res.config?.url || '';
         const match = finalUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
-        if (match) {
-            console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via Puppeteer)`);
+        if (match && match[1] !== 'imdb') {
+            console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via axios redirect)`);
             return match[1];
         }
-        return null;
     } catch (err) {
-        if (page) await page.close().catch(() => {});
-        console.error(`[resolveSlug] Puppeteer failed for ${imdbId}:`, err.message);
-        return null;
+        console.warn(`[resolveSlug] axios redirect failed for ${imdbId}:`, err.message);
     }
+
+    // Second try: scrape the film page HTML — Letterboxd includes the canonical
+    // slug in several places we can reliably extract it from.
+    try {
+        const res = await axios.get(`${BASE_URL}/film/imdb/${imdbId}/`, {
+            headers: BASE_HEADERS,
+            timeout: 10000,
+            maxRedirects: 5,
+            validateStatus: s => s < 500,
+        });
+        const $ = cheerio.load(res.data);
+        // og:url is like https://letterboxd.com/film/violent-cop/
+        const ogUrl = $('meta[property="og:url"]').attr('content') || '';
+        const match = ogUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
+        if (match && match[1] !== 'imdb') {
+            console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via og:url)`);
+            return match[1];
+        }
+    } catch (err) {
+        console.warn(`[resolveSlug] og:url scrape failed for ${imdbId}:`, err.message);
+    }
+
+    console.error(`[resolveSlug] Could not resolve slug for ${imdbId}`);
+    return null;
 }
 
 module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, addToWatchlist, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };
