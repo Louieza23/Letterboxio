@@ -285,7 +285,8 @@ app.listen(PORT, () => {
     // without waiting for the catalog to be opened first
     getWatchlist(USERNAME).then(async films => {
         console.log(`[startup] Pre-warming slug cache for ${films.length} films...`);
-        const CONCURRENCY = 5;
+        // Low concurrency at startup to avoid memory spikes
+        const CONCURRENCY = 2;
         for (let i = 0; i < films.length; i += CONCURRENCY) {
             const batch = films.slice(i, i + CONCURRENCY);
             await Promise.all(batch.map(async film => {
@@ -294,6 +295,8 @@ app.listen(PORT, () => {
                     if (meta.imdbId) imdbToSlugCache.set(meta.imdbId, film.slug);
                 } catch {}
             }));
+            // Small pause between batches to keep memory pressure low
+            await new Promise(r => setTimeout(r, 100));
         }
         console.log(`[startup] Slug cache ready (${imdbToSlugCache.size} entries)`);
     }).catch(err => console.error('[startup] Cache warm failed:', err.message));
