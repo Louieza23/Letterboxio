@@ -262,16 +262,19 @@ async function ensureBrowserLoggedIn() {
     const page = await b.newPage();
     try {
         console.log('[puppeteer] Logging in to Letterboxd...');
-        await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Wait for the form to be present (also handles Cloudflare challenge delay)
-        await page.waitForSelector('input[name="username"]', { timeout: 20000 });
+        // networkidle2 gives Cloudflare's JS challenge time to complete.
+        // 60s timeout — login is only done once per container lifetime.
+        await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'networkidle2', timeout: 60000 });
+
+        // Wait for the login form — confirms Cloudflare challenge is done
+        await page.waitForSelector('input[name="username"]', { timeout: 30000 });
 
         await page.type('input[name="username"]', username, { delay: 50 });
         await page.type('input[name="password"]', password, { delay: 50 });
 
         await Promise.all([
-            page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+            page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 60000 }),
             page.click('input[type="submit"], button[type="submit"]'),
         ]);
 
@@ -393,7 +396,8 @@ async function rateFilm(slug, starRating) {
             return { success: false, error: `HTTP ${result.status}: ${result.body.slice(0, 100)}` };
         }
     } catch (err) {
-        browser = null;
+        // Don't kill the browser — just reset login state so we re-login on the
+        // same browser instance rather than launching a fresh Chromium (RAM spike)
         browserLoggedIn = false;
         sessionCsrf = null;
         return { success: false, error: err.message };
@@ -406,9 +410,14 @@ async function rateFilm(slug, starRating) {
 // To force a specific direction we pass `remove=1` for removal.
 
 async function getFilmId(slug) {
+    // Use session cookies from the logged-in browser — film pages are behind
+    // Cloudflare and will 403 with bare axios
     try {
+        const b = await ensureBrowserLoggedIn();
+        const cookies = await b.cookies(`${BASE_URL}/film/${slug}/`);
+        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
         const res = await axios.get(`${BASE_URL}/film/${slug}/`, {
-            headers: BASE_HEADERS,
+            headers: { ...BASE_HEADERS, 'Cookie': cookieHeader },
             timeout: 10000,
         });
         const $ = cheerio.load(res.data);
