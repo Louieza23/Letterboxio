@@ -264,7 +264,7 @@ async function ensureBrowserLoggedIn() {
         await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
         // Wait for the form to be present (also handles Cloudflare challenge delay)
-        await page.waitForSelector('input[name="username"]', { timeout: 20000 });
+        await page.waitForSelector('input[name="username"]', { timeout: 45000 });
 
         await page.type('input[name="username"]', username, { delay: 50 });
         await page.type('input[name="password"]', password, { delay: 50 });
@@ -373,7 +373,8 @@ async function rateFilm(slug, starRating) {
         }
     } catch (err) {
         if (page) await page.close().catch(() => {});
-        browser = null;
+        // Do NOT null out browser — keep Chromium alive to avoid cold restart RAM spike.
+        // Just reset login state so we re-login on the existing browser instance.
         browserLoggedIn = false;
         return { success: false, error: err.message };
     }
