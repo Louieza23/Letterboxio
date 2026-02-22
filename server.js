@@ -4,7 +4,7 @@ const { addonBuilder } = require('stremio-addon-sdk');
 const express = require('express');
 const axios = require('axios');
 const cheerio = require('cheerio');
-const { getWatchlist, getFilmMeta, rateFilm, addToWatchlist, removeFromWatchlist, hasSession, resolveSlugFromImdbViaPuppeteer } = require('./letterboxd');
+const { getWatchlist, getFilmMeta, rateFilm, hasSession, resolveSlugFromImdbViaPuppeteer } = require('./letterboxd');
 
 const USERNAME = process.env.LETTERBOXD_USERNAME || 'snuffalobill';
 const PORT = process.env.PORT || 7000;
@@ -113,24 +113,12 @@ builder.defineStreamHandler(({ type, id }) => {
     let baseUrl = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
     if (baseUrl && !baseUrl.startsWith('http')) baseUrl = `https://${baseUrl}`;
 
-    // Return rating buttons + watchlist buttons instantly.
-    const streams = [
-        {
-            name: '📋 Letterboxio',
-            description: 'Add to Letterboxd Watchlist',
-            url: `${baseUrl}/watchlist/add/${encodeURIComponent(id)}`,
-        },
-        {
-            name: '🗑️ Letterboxio',
-            description: 'Remove from Letterboxd Watchlist',
-            url: `${baseUrl}/watchlist/remove/${encodeURIComponent(id)}`,
-        },
-        ...STAR_OPTIONS.map(opt => ({
-            name: 'Rate on Letterboxd',
-            description: opt.label,
-            url: `${baseUrl}/rate/${encodeURIComponent(id)}/${encodeURIComponent(opt.stars)}`,
-        })),
-    ];
+    // Return rating buttons instantly — no async work, no Puppeteer, no timeouts.
+    const streams = STAR_OPTIONS.map(opt => ({
+        name: 'Rate on Letterboxd',
+        description: opt.label,
+        url: `${baseUrl}/rate/${encodeURIComponent(id)}/${encodeURIComponent(opt.stars)}`,
+    }));
 
     return Promise.resolve({ streams });
 });
@@ -196,52 +184,16 @@ app.get('/rate/:imdbId/:stars', (req, res) => {
         return;
     }
 
+    // Deduplicate — Android TV fires the same request 3-4x simultaneously
     if (!deduplicateRating(imdbId, stars)) return;
 
+    // Resolve slug then enqueue (one Puppeteer page at a time)
     resolveSlugFromImdb(imdbId).then(slug => {
         if (!slug) { console.error(`[rate] Could not resolve slug for ${imdbId}`); return; }
-        enqueuePuppeteer(async () => {
-            const result = await rateFilm(slug, stars);
-            console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
-        });
-    }).catch(err => console.error(`[rate] Slug resolve error:`, err.message));
-});
-
-// ── /watchlist endpoints ──────────────────────────────────────────────────────
-
-app.get('/watchlist/add/:imdbId', (req, res) => {
-    const { imdbId } = req.params;
-    console.log(`[watchlist] add ${imdbId}`);
-    serveM3U8(res);
-    if (!hasSession()) { console.error('[watchlist] No session configured'); return; }
-    if (!deduplicateRating(imdbId, 'watchlist-add')) return;
-    resolveSlugFromImdb(imdbId).then(slug => {
-        if (!slug) { console.error(`[watchlist] Could not resolve slug for ${imdbId}`); return; }
-        enqueuePuppeteer(async () => {
-            const result = await addToWatchlist(slug);
-            console.log(`[watchlist add] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
-        });
-    }).catch(err => console.error(`[watchlist add] Error:`, err.message));
-});
-
-app.get('/watchlist/remove/:imdbId', (req, res) => {
-    const { imdbId } = req.params;
-    console.log(`[watchlist] remove ${imdbId}`);
-    serveM3U8(res);
-    if (!hasSession()) { console.error('[watchlist] No session configured'); return; }
-    if (!deduplicateRating(imdbId, 'watchlist-remove')) return;
-    resolveSlugFromImdb(imdbId).then(slug => {
-        if (!slug) { console.error(`[watchlist] Could not resolve slug for ${imdbId}`); return; }
-        enqueuePuppeteer(async () => {
-            const result = await removeFromWatchlist(slug);
-            console.log(`[watchlist remove] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
-        });
-    }).catch(err => console.error(`[watchlist remove] Error:`, err.message));
-});
-
-// Legacy route — redirect to add (backwards compat with any cached Stremio streams)
-app.get('/watchlist/:imdbId', (req, res) => {
-    res.redirect(301, `/watchlist/add/${req.params.imdbId}`);
+        enqueueRating(slug, stars);
+    }).catch(err => {
+        console.error(`[rate] Slug resolve error:`, err.message);
+    });
 });
 
 // ── /noop endpoint ────────────────────────────────────────────────────────────
@@ -255,36 +207,37 @@ app.get('/noop', (req, res) => {
 // We deduplicate by ignoring requests for the same film within 5 seconds,
 // and queue rating jobs so only one Puppeteer page runs at a time.
 
-const recentRatings = new Map(); // key → timestamp of last accepted request
-const puppeteerQueue = [];       // pending { fn } jobs — one Puppeteer page at a time
-let puppeteerRunning = false;
+const recentRatings = new Map(); // imdbId → timestamp of last accepted rating
+const ratingQueue = [];          // pending { slug, stars } jobs
+let ratingRunning = false;
 
-function deduplicateRating(imdbId, action) {
-    const key = `${imdbId}:${action}`;
+function deduplicateRating(imdbId, stars) {
+    const key = `${imdbId}:${stars}`;
     const last = recentRatings.get(key);
     if (last && Date.now() - last < 5000) {
-        console.log(`[dedup] Duplicate ignored for ${key}`);
-        return false;
+        console.log(`[rate] Duplicate ignored for ${key}`);
+        return false; // duplicate
     }
     recentRatings.set(key, Date.now());
     return true;
 }
 
-function enqueuePuppeteer(fn) {
-    puppeteerQueue.push(fn);
-    if (!puppeteerRunning) processPuppeteerQueue();
+function enqueueRating(slug, stars) {
+    ratingQueue.push({ slug, stars });
+    if (!ratingRunning) processRatingQueue();
 }
 
-async function processPuppeteerQueue() {
-    if (puppeteerQueue.length === 0) { puppeteerRunning = false; return; }
-    puppeteerRunning = true;
-    const fn = puppeteerQueue.shift();
+async function processRatingQueue() {
+    if (ratingQueue.length === 0) { ratingRunning = false; return; }
+    ratingRunning = true;
+    const { slug, stars } = ratingQueue.shift();
     try {
-        await fn();
+        const result = await rateFilm(slug, stars);
+        console.log(`[rate] ${result.success ? 'OK' : 'FAILED: ' + result.error}`);
     } catch (err) {
-        console.error(`[queue] Error:`, err.message);
+        console.error(`[rate] Queue error:`, err.message);
     }
-    processPuppeteerQueue();
+    processRatingQueue(); // process next
 }
 
 // ── Slug resolution ───────────────────────────────────────────────────────────

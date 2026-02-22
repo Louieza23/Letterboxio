@@ -215,7 +215,6 @@ const RATING_MAP = {
 
 let browser = null;
 let browserLoggedIn = false;
-let sessionCsrf = null; // CSRF token grabbed at login, reused for all requests
 
 async function getBrowser() {
     if (browser && browser.connected) return browser;
@@ -262,15 +261,10 @@ async function ensureBrowserLoggedIn() {
     const page = await b.newPage();
     try {
         console.log('[puppeteer] Logging in to Letterboxd...');
-
-        // domcontentloaded fires quickly; Cloudflare challenge (if any) runs as JS
-        // after this. We then waitForSelector with a long timeout — it will wait
-        // until the challenge clears and the real login form appears.
         await page.goto(`${BASE_URL}/sign-in/`, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // This is the key wait — up to 45s for Cloudflare challenge to resolve
-        // and the actual username input to appear in the DOM.
-        await page.waitForSelector('input[name="username"]', { timeout: 45000 });
+        // Wait for the form to be present (also handles Cloudflare challenge delay)
+        await page.waitForSelector('input[name="username"]', { timeout: 20000 });
 
         await page.type('input[name="username"]', username, { delay: 50 });
         await page.type('input[name="password"]', password, { delay: 50 });
@@ -287,14 +281,6 @@ async function ensureBrowserLoggedIn() {
             throw new Error('Login failed — still on sign-in page. Check credentials in .env.');
         }
 
-        // Grab CSRF token once — it persists for the whole session
-        sessionCsrf = await page.evaluate(() =>
-            document.querySelector('input[name="__csrf"]')?.value
-            || document.querySelector('meta[name="csrf-token"]')?.content
-            || document.body?.getAttribute('data-csrf')
-        );
-        console.log(`[puppeteer] CSRF captured: ${sessionCsrf?.slice(0, 8)}...`);
-
         browserLoggedIn = true;
         console.log('[puppeteer] Login successful');
     } finally {
@@ -304,17 +290,18 @@ async function ensureBrowserLoggedIn() {
     return b;
 }
 
-// Make a POST to a Letterboxd API endpoint using the session cookies from
-// the logged-in Puppeteer browser.
-// IMPORTANT: fetch() with credentials: 'include' only works from a same-origin
-// page. We navigate to letterboxd.com first so cookies are sent correctly.
-async function puppeteerPost(url, body) {
-    const b = await ensureBrowserLoggedIn();
-    if (!sessionCsrf) throw new Error('No CSRF token — login may have failed');
+async function rateFilm(slug, starRating) {
+    const ratingValue = RATING_MAP[String(starRating)];
+    if (!ratingValue) {
+        return { success: false, error: `Invalid rating value: ${starRating}` };
+    }
 
-    const page = await b.newPage();
+    let page;
     try {
-        // Block heavy resources — we only need the DOM to exist so fetch() runs
+        const b = await ensureBrowserLoggedIn();
+        page = await b.newPage();
+
+        // Block images/styles/fonts to reduce memory usage on Railway's 512MB container
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
@@ -324,64 +311,51 @@ async function puppeteerPost(url, body) {
             }
         });
 
-        // Navigate to letterboxd.com so fetch() runs from the correct origin
-        // and session cookies are included automatically.
-        // 'commit' fires as soon as the response starts — we don't need to wait
-        // for the page to actually render, just for the origin to be established.
-        await page.goto(`${BASE_URL}/`, {
-            waitUntil: 'commit',
-            timeout: 20000,
-        });
+        const filmUrl = `${BASE_URL}/film/${slug}/`;
+        console.log(`[puppeteer] Navigating to ${filmUrl}`);
+        await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        const result = await page.evaluate(async (url, body) => {
-            const res = await fetch(url, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                body,
-                credentials: 'include',
-            });
-            return { status: res.status, body: await res.text() };
-        }, url, new URLSearchParams({ ...body, __csrf: sessionCsrf }).toString());
-
-        return result;
-    } finally {
-        await page.close();
-    }
-}
-
-async function rateFilm(slug, starRating) {
-    const ratingValue = RATING_MAP[String(starRating)];
-    if (!ratingValue) {
-        return { success: false, error: `Invalid rating value: ${starRating}` };
-    }
-
-    try {
-        await ensureBrowserLoggedIn();
-
-        // Get the film's Letterboxd ID from the watchlist cache (already fetched)
-        // or fall back to scraping the film page with axios (not Puppeteer)
-        const filmMeta = await getFilmMeta(slug);
-        let filmId = null;
-
-        // Try to get filmId via axios from the film page (lightweight, no JS needed)
-        try {
-            const res = await axios.get(`${BASE_URL}/film/${slug}/`, {
-                headers: BASE_HEADERS,
-                timeout: 10000,
-            });
-            const $ = cheerio.load(res.data);
-            filmId = $('[data-film-id]').first().attr('data-film-id')
-                || $('body').attr('data-film-id');
-        } catch {}
-
-        if (!filmId) {
-            return { success: false, error: `Could not find film ID for ${slug}` };
+        // Check if Cloudflare served a challenge page instead of the real page
+        const pageTitle = await page.title();
+        if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
+            console.log(`[puppeteer] Cloudflare challenge detected, waiting...`);
+            await new Promise(r => setTimeout(r, 5000));
+            await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
         }
 
-        console.log(`[puppeteer] Rating film:${filmId} (${slug}) → ${ratingValue}`);
-        const result = await puppeteerPost(`${BASE_URL}/s/film:${filmId}/rate/`, { rating: ratingValue });
+        // Wait for the rateit widget to render and grab its data attributes
+        await page.waitForSelector('div.rateit[data-rate-action]', { timeout: 15000 });
+
+        const widgetData = await page.evaluate(() => {
+            const widget = document.querySelector('div.rateit[data-rate-action]');
+            // CSRF is available in multiple places; try all
+            const csrf = document.querySelector('input[name="__csrf"]')?.value
+                || document.querySelector('meta[name="csrf-token"]')?.content
+                || document.body.getAttribute('data-csrf');
+            return {
+                rateAction: widget?.getAttribute('data-rate-action'),
+                csrf,
+            };
+        });
+
+        console.log(`[puppeteer] rateAction=${widgetData.rateAction} csrf=${widgetData.csrf?.slice(0, 8)}...`);
+
+        if (!widgetData.rateAction) {
+            return { success: false, error: 'Could not find rating widget — may not be logged in' };
+        }
+
+        // POST directly to the rate endpoint discovered from the widget
+        const result = await page.evaluate(async (rateAction, csrf, ratingValue, baseUrl) => {
+            const res = await fetch(`${baseUrl}${rateAction}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: new URLSearchParams({ rating: ratingValue, __csrf: csrf }),
+            });
+            return { status: res.status, body: await res.text() };
+        }, widgetData.rateAction, widgetData.csrf, ratingValue, BASE_URL);
 
         console.log(`[puppeteer] rating response: ${result.status} ${result.body.slice(0, 150)}`);
+        await page.close();
 
         if (result.status === 200) {
             let parsed;
@@ -394,149 +368,52 @@ async function rateFilm(slug, starRating) {
                 return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
             }
         } else {
-            if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
+            if (result.status === 403) browserLoggedIn = false;
             return { success: false, error: `HTTP ${result.status}: ${result.body.slice(0, 100)}` };
         }
     } catch (err) {
-        // Don't kill the browser — just reset login state so we re-login on the
-        // same browser instance rather than launching a fresh Chromium (RAM spike)
+        if (page) await page.close().catch(() => {});
+        browser = null;
         browserLoggedIn = false;
-        sessionCsrf = null;
         return { success: false, error: err.message };
     }
 }
 
-// ── Watchlist helpers ─────────────────────────────────────────────────────────
-// Both add and remove use POST to the same endpoint — Letterboxd treats it as
-// a toggle, but the response includes a `watchlisted` boolean we can check.
-// To force a specific direction we pass `remove=1` for removal.
+// ── Resolve slug from IMDB ID via Puppeteer ───────────────────────────────────
+// Used as fallback for films outside the watchlist.
+// Letterboxd redirects /film/imdb/{imdbId}/ to the correct film page.
 
-async function getFilmId(slug) {
-    // Use session cookies from the logged-in browser — film pages are behind
-    // Cloudflare and will 403 with bare axios
+async function resolveSlugFromImdbViaPuppeteer(imdbId) {
+    let page;
     try {
         const b = await ensureBrowserLoggedIn();
-        const cookies = await b.cookies(`${BASE_URL}/film/${slug}/`);
-        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-        const res = await axios.get(`${BASE_URL}/film/${slug}/`, {
-            headers: { ...BASE_HEADERS, 'Cookie': cookieHeader },
-            timeout: 10000,
+        page = await b.newPage();
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            if (['image', 'stylesheet', 'font', 'media'].includes(req.resourceType())) {
+                req.abort();
+            } else {
+                req.continue();
+            }
         });
-        const $ = cheerio.load(res.data);
-        return $('[data-film-id]').first().attr('data-film-id')
-            || $('body').attr('data-film-id')
-            || null;
-    } catch {
+        await page.goto(`${BASE_URL}/film/imdb/${imdbId}/`, {
+            waitUntil: 'domcontentloaded',
+            timeout: 20000,
+        });
+        const finalUrl = page.url();
+        await page.close();
+        // Final URL is like https://letterboxd.com/film/violent-cop/
+        const match = finalUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
+        if (match) {
+            console.log(`[resolveSlug] ${imdbId} → ${match[1]} (via Puppeteer)`);
+            return match[1];
+        }
+        return null;
+    } catch (err) {
+        if (page) await page.close().catch(() => {});
+        console.error(`[resolveSlug] Puppeteer failed for ${imdbId}:`, err.message);
         return null;
     }
 }
 
-async function addToWatchlist(slug) {
-    try {
-        await ensureBrowserLoggedIn();
-        const filmId = await getFilmId(slug);
-        if (!filmId) return { success: false, error: `Could not find film ID for ${slug}` };
-
-        console.log(`[puppeteer] Adding film:${filmId} (${slug}) to watchlist`);
-        const result = await puppeteerPost(`${BASE_URL}/s/film:${filmId}/watchlist/`, {});
-        console.log(`[puppeteer] watchlist add response: ${result.status} ${result.body.slice(0, 150)}`);
-
-        if (result.status === 200) {
-            let parsed;
-            try { parsed = JSON.parse(result.body); } catch {}
-            if (parsed?.result === true || parsed?.watchlisted === true) {
-                cache.delete(`watchlist:${process.env.LETTERBOXD_USERNAME}`);
-                return { success: true };
-            }
-            return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
-        }
-        if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
-        return { success: false, error: `HTTP ${result.status}` };
-    } catch (err) {
-        return { success: false, error: err.message };
-    }
-}
-
-async function removeFromWatchlist(slug) {
-    try {
-        await ensureBrowserLoggedIn();
-        const filmId = await getFilmId(slug);
-        if (!filmId) return { success: false, error: `Could not find film ID for ${slug}` };
-
-        console.log(`[puppeteer] Removing film:${filmId} (${slug}) from watchlist`);
-        // POST with remove=1 explicitly removes rather than toggling
-        const result = await puppeteerPost(`${BASE_URL}/s/film:${filmId}/watchlist/`, { remove: '1' });
-        console.log(`[puppeteer] watchlist remove response: ${result.status} ${result.body.slice(0, 150)}`);
-
-        if (result.status === 200) {
-            let parsed;
-            try { parsed = JSON.parse(result.body); } catch {}
-            // watchlisted:false means it was successfully removed
-            if (parsed?.result === true || parsed?.watchlisted === false) {
-                cache.delete(`watchlist:${process.env.LETTERBOXD_USERNAME}`);
-                return { success: true };
-            }
-            return { success: false, error: `Unexpected response: ${result.body.slice(0, 100)}` };
-        }
-        if (result.status === 403) { browserLoggedIn = false; sessionCsrf = null; }
-        return { success: false, error: `HTTP ${result.status}` };
-    } catch (err) {
-        return { success: false, error: err.message };
-    }
-}
-
-// ── Resolve slug from IMDB ID ─────────────────────────────────────────────────
-// Letterboxd does a server-side redirect from /film/imdb/{imdbId}/ to the
-// correct film page. We follow that redirect with axios (no Puppeteer needed).
-
-async function resolveSlugFromImdbViaPuppeteer(imdbId) {
-    // Strategy: use the session cookies from the logged-in Puppeteer browser to
-    // make an axios request. Authenticated requests bypass Cloudflare's bot check.
-    // This is much lighter than opening a new Puppeteer page (no Chrome rendering).
-    try {
-        const b = await ensureBrowserLoggedIn();
-
-        // Extract session cookies from the browser
-        const cookies = await b.cookies(`${BASE_URL}/film/imdb/${imdbId}/`);
-        const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-
-        const res = await axios.get(`${BASE_URL}/film/imdb/${imdbId}/`, {
-            headers: {
-                ...BASE_HEADERS,
-                'Cookie': cookieHeader,
-            },
-            timeout: 15000,
-            maxRedirects: 5,
-            validateStatus: s => s < 500,
-        });
-
-        const responseUrl = res.request?.res?.responseUrl || '';
-        console.log(`[resolveSlug] ${imdbId} status=${res.status} responseUrl="${responseUrl}"`);
-
-        // Check the final redirected URL first
-        const urlMatch = responseUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
-        if (urlMatch && urlMatch[1] !== 'imdb') {
-            console.log(`[resolveSlug] ${imdbId} → ${urlMatch[1]} (via authed axios redirect)`);
-            return urlMatch[1];
-        }
-
-        // Fall back to og:url in the HTML
-        const $ = cheerio.load(res.data);
-        const ogUrl = $('meta[property="og:url"]').attr('content') || '';
-        console.log(`[resolveSlug] ${imdbId} og:url="${ogUrl}"`);
-        const ogMatch = ogUrl.match(/letterboxd\.com\/film\/([^/]+)\//);
-        if (ogMatch && ogMatch[1] !== 'imdb') {
-            console.log(`[resolveSlug] ${imdbId} → ${ogMatch[1]} (via og:url)`);
-            return ogMatch[1];
-        }
-
-        console.warn(`[resolveSlug] ${imdbId} — no slug found. HTML snippet: ${res.data.slice(0, 200).replace(/\s+/g, ' ')}`);
-    } catch (err) {
-        console.error(`[resolveSlug] authed axios failed for ${imdbId}:`, err.message);
-    }
-
-    console.error(`[resolveSlug] Could not resolve slug for ${imdbId}`);
-    return null;
-}
-
-module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, addToWatchlist, removeFromWatchlist, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };
+module.exports = { getWatchlist, getFilmMeta, getUserRating, rateFilm, hasSession, getFromCache: getCache, resolveSlugFromImdbViaPuppeteer };
