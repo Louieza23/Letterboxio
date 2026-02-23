@@ -315,11 +315,16 @@ async function rateFilm(slug, starRating) {
         console.log(`[puppeteer] Navigating to ${filmUrl}`);
         await page.goto(filmUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-        // Check if Cloudflare served a challenge page instead of the real page
-        const pageTitle = await page.title();
-        if (pageTitle.includes('Just a moment') || pageTitle.includes('Attention Required')) {
-            console.log(`[puppeteer] Cloudflare challenge detected, waiting...`);
-            await new Promise(r => setTimeout(r, 5000));
+        // Check if Cloudflare served a challenge page instead of the real page.
+        // Check both title and body — CF challenge titles vary by region/type.
+        const isChallenge = await page.evaluate(() => {
+            const title = document.title || '';
+            const hasCFWidget = !!document.querySelector('#cf-wrapper, #challenge-form, .cf-browser-verification');
+            return title.includes('Just a moment') || title.includes('Attention Required') || hasCFWidget;
+        });
+        if (isChallenge) {
+            console.log(`[puppeteer] Cloudflare challenge detected, waiting 10s...`);
+            await new Promise(r => setTimeout(r, 10000));
             await page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
         }
 
@@ -373,9 +378,23 @@ async function rateFilm(slug, starRating) {
         }
     } catch (err) {
         if (page) await page.close().catch(() => {});
-        // Do NOT null out browser — keep Chromium alive to avoid cold restart RAM spike.
-        // Just reset login state so we re-login on the existing browser instance.
-        browserLoggedIn = false;
+        const msg = err.message || '';
+
+        if (msg.includes('DOM.describeNode') || msg.includes('Protocol error') ||
+            msg.includes('Target closed') || msg.includes('Session closed')) {
+            // Browser process is hung or dead — must restart entirely
+            console.error('[puppeteer] Browser unresponsive, will restart on next request');
+            try { if (browser) await browser.close(); } catch {}
+            browser = null;
+            browserLoggedIn = false;
+        } else if (msg.includes('sign-in') || msg.includes('Login failed')) {
+            // Genuinely logged out — re-login but keep browser
+            browserLoggedIn = false;
+        }
+        // Navigation timeout, selector timeout, Cloudflare page, etc:
+        // the browser is still alive and the session cookies are still valid.
+        // Do NOT reset browserLoggedIn — skips unnecessary re-login on next request.
+
         return { success: false, error: err.message };
     }
 }
